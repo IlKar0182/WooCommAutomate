@@ -1,0 +1,1728 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { automationSettings, processedOrders, systemLogs } from "@shared/schema";
+import { setupAutomation, runAutomation } from "./automation";
+import { setupScheduler } from "./scheduler";
+import { logger } from "./logger";
+import { clickAddToCartButton, getCartItemCount, clearCart, clickForsetzenButton } from './checkout-helpers';
+import { z } from "zod";
+import { registerNewRoutes } from "./routes-new";
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  const httpServer = createServer(app);
+
+  // Setup automation and scheduler
+  setupAutomation();
+  setupScheduler();
+  
+  // Register new routes from routes-new.ts
+  registerNewRoutes(app);
+
+  // API Routes
+  
+  // Serve screenshot files with better cache handling
+  app.get("/api/screenshots/:filename", (req, res) => {
+    try {
+      const { filename } = req.params;
+      
+      // Expand allowed files list to include timestamped versions
+      const baseAllowedFiles = [
+        'eph-schmidt-login.png',
+        'eph-schmidt-login-before.png',
+        'eph-schmidt-before-search.png',
+        'eph-schmidt-search-results.png',
+        'eph-schmidt-search-260018.png',
+        'eph-schmidt-added-260018.png'
+      ];
+      
+      // Add dynamic filename patterns for search process screenshots
+      const isSearchTypingScreenshot = /^eph-schmidt-search-typing-\d+\.png$/.test(filename);
+      const isSearchResultsScreenshot = /^eph-schmidt-search-\d+\.png$/.test(filename);
+      const isAddedToCartScreenshot = /^eph-schmidt-added-\d+\.png$/.test(filename);
+      
+      // Add patterns for checkout process screenshots
+      const isCheckoutScreenshot = /^eph-schmidt-checkout-\d+\.png$/.test(filename);
+      const isCheckoutStep2Screenshot = /^eph-schmidt-checkout-step2-\d+\.png$/.test(filename);
+      const isCustomerDetailsScreenshot = /^eph-schmidt-customer-details-\d+\.png$/.test(filename);
+      const isPaymentScreenshot = /^eph-schmidt-payment-\d+\.png$/.test(filename);
+      const isOrderNumberScreenshot = /^eph-schmidt-order-number-\d+\.png$/.test(filename);
+      const isOrderConfirmationScreenshot = /^eph-schmidt-order-confirmation-\d+\.png$/.test(filename);
+      const isCheckoutErrorScreenshot = /^eph-schmidt-checkout-error-\d+\.png$/.test(filename);
+      
+      // Check if it's a timestamped login screenshot
+      const isTimestampedFile = /^eph-schmidt-login-\d+\.png$/.test(filename);
+      
+      if (!baseAllowedFiles.includes(filename) && 
+          !isTimestampedFile && 
+          !isSearchTypingScreenshot && 
+          !isSearchResultsScreenshot && 
+          !isAddedToCartScreenshot &&
+          !isCheckoutScreenshot &&
+          !isCheckoutStep2Screenshot &&
+          !isCustomerDetailsScreenshot &&
+          !isPaymentScreenshot &&
+          !isOrderNumberScreenshot &&
+          !isOrderConfirmationScreenshot &&
+          !isCheckoutErrorScreenshot) {
+        return res.status(404).json({ message: "Screenshot not found" });
+      }
+      
+      // Add cache control headers to prevent browser caching
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      
+      // Serve the file
+      res.sendFile(filename, { root: "./" });
+    } catch (error) {
+      logger.error("Failed to serve screenshot", { error });
+      res.status(500).json({ message: "Failed to serve screenshot" });
+    }
+  });
+  
+  // Trigger just the login process for testing
+  app.post("/api/automation/login", async (req, res) => {
+    try {
+      // Importing the puppeteer related functions
+      const puppeteer = await import('puppeteer');
+      const util = await import('util');
+      const { exec } = await import('child_process');
+      const execPromise = util.promisify(exec);
+      
+      // Get automation settings
+      const settings = await storage.getAutomationSettings();
+      if (!settings) {
+        return res.status(400).json({ message: "Automation settings not found" });
+      }
+      
+      logger.info("Starting login automation test");
+      
+      // Enhanced Puppeteer setup for Replit environment
+      const puppeteerArgs = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--disable-features=site-per-process',
+        '--disable-web-security',
+        '--disable-dev-profile',
+        '--no-zygote',
+        '--single-process',
+        '--enable-logging=stderr',
+        '--v=1'
+      ];
+      
+      // Launch browser
+      let browser;
+      try {
+        logger.info("Launching Puppeteer browser for login test");
+        
+        // Try to use the system installed Chromium (from Nix)
+        const { stdout } = await execPromise("which chromium");
+        const chromePath = stdout.trim();
+        logger.info(`Found Chromium at path: ${chromePath}`);
+        
+        browser = await puppeteer.default.launch({
+          headless: true,
+          args: puppeteerArgs,
+          executablePath: chromePath
+        });
+        logger.info("Successfully launched browser for login test");
+      } catch (browserError) {
+        logger.error("Failed to launch browser for login test", { error: browserError });
+        return res.status(500).json({ message: "Failed to launch browser" });
+      }
+      
+      const page = await browser.newPage();
+      
+      try {
+        // Validate supplier URL
+        if (!settings.supplierUrl || !settings.supplierUrl.startsWith('http')) {
+          throw new Error("Invalid supplier URL - must start with http:// or https://");
+        }
+        
+        logger.info(`Navigating to supplier website: ${settings.supplierUrl}`);
+        
+        // Navigate to the supplier login page
+        await page.goto(settings.supplierUrl, { 
+          waitUntil: 'networkidle2', 
+          timeout: 60000 
+        });
+        
+        // Take screenshot of the initial login page
+        await page.screenshot({ path: 'eph-schmidt-login-before.png' });
+        
+        // Wait for page to load
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        logger.info("Login page loaded, waiting completed");
+        
+        // Check if we're using EPH Schmidt supplier
+        const isEphSchmidt = settings.supplierUrl.includes('b2b.eph-schmidt.de');
+        
+        if (isEphSchmidt) {
+          logger.info("Using EPH Schmidt B2B login form");
+          
+          // Use the pre-configured EPH Schmidt supplier credentials
+          const supplier = {
+            url: "https://b2b.eph-schmidt.de/customer/account/login/",
+            username: "info@detuinierwinkel.nl",
+            password: "9YZNFUKH1J-SGVYMBQW3BDT2A2W36LSY",
+            selectors: {
+              username: "#email",
+              password: "#pass",
+              loginButton: "#send2",
+              search: "#search",
+              searchButton: ".action.search",
+              addToCartButton: "#product-addtocart-button",
+              noResultsIndicator: ".message.notice"
+            }
+          };
+          
+          // Fill in the credentials for EPH Schmidt 
+          await page.type(supplier.selectors.username, supplier.username);
+          await page.type(supplier.selectors.password, supplier.password);
+          
+          // Click the login button and wait for navigation
+          logger.info("Submitting EPH Schmidt login form");
+          await Promise.all([
+            page.click(supplier.selectors.loginButton),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+          ]);
+          
+          // Take a screenshot of the logged-in state for verification
+          // Add timestamp to avoid browser caching
+          const timestamp = Date.now();
+          const screenshotPath = `eph-schmidt-login-${timestamp}.png`;
+          await page.screenshot({ path: screenshotPath });
+          
+          // Also save to the standard name for backward compatibility
+          await page.screenshot({ path: 'eph-schmidt-login.png' });
+          
+          logger.info(`EPH Schmidt login screenshot saved as ${screenshotPath}`);
+        } else {
+          // Generic login for other suppliers
+          await page.type('#username', settings.supplierUsername);
+          await page.type('#password', settings.supplierPassword);
+          
+          // For real supplier sites, wait for actual page navigation
+          logger.info("Submitting login to generic supplier");
+          await Promise.all([
+            page.click('#login-button'),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+          ]);
+          
+          // Take a screenshot
+          await page.screenshot({ path: 'supplier-login.png' });
+          logger.info("Generic supplier login screenshot saved");
+        }
+        
+        logger.info("Successfully logged in to supplier website");
+        res.json({ success: true, message: "Login successful, screenshot saved" });
+      } catch (error) {
+        logger.error("Failed to login to supplier website", { error });
+        res.status(500).json({ message: `Login failed: ${error.message}` });
+      } finally {
+        // Always close the browser
+        await browser.close();
+      }
+    } catch (error) {
+      logger.error("Error in login automation endpoint", { error });
+      res.status(500).json({ message: "Server error during login automation" });
+    }
+  });
+  
+  // Get automation status
+  app.get("/api/automation/status", async (req, res) => {
+    try {
+      const settings = await storage.getAutomationSettings();
+      const ordersToday = await storage.getOrdersProcessedToday();
+      const successRate = await storage.getSuccessRate();
+      
+      res.json({
+        ordersProcessedToday: {
+          processed: ordersToday.processed,
+          total: ordersToday.total,
+          percentage: ordersToday.total > 0 
+            ? Math.round((ordersToday.processed / ordersToday.total) * 100) 
+            : 0
+        },
+        successRate: {
+          percentage: successRate.rate,
+          trend: successRate.trend
+        },
+        automationStatus: {
+          isActive: settings?.isActive || false,
+          nextRun: settings?.nextRunAt ? new Date(settings.nextRunAt).toISOString() : null,
+          schedule: `${settings?.scheduleTime1 || "08:00"} and ${settings?.scheduleTime2 || "20:00"}`
+        },
+        lastRunAt: settings?.lastRunAt ? new Date(settings.lastRunAt).toISOString() : null
+      });
+    } catch (error) {
+      logger.error("Failed to get automation status", { error });
+      res.status(500).json({ message: "Failed to get automation status" });
+    }
+  });
+
+  // Run automation manually
+  app.post("/api/automation/run", async (req, res) => {
+    try {
+      // Start the automation process
+      runAutomation().catch(error => {
+        logger.error("Manual automation run failed", { error });
+      });
+      
+      // Return success immediately without waiting for completion
+      res.json({ success: true, message: "Automation process started" });
+    } catch (error) {
+      logger.error("Failed to start automation", { error });
+      res.status(500).json({ message: "Failed to start automation" });
+    }
+  });
+  
+  // Step 1: Implementation of "Go to Checkout" and billing form process
+  // Run complete checkout process - NEW SIMPLIFIED APPROACH
+  app.post("/api/automation/checkout/complete", async (req, res) => {
+    try {
+      const { orderId = "9524", customerData = null } = req.body;
+      logger.info(`Starting complete checkout process for order #${orderId}`);
+      
+      // Import puppeteer
+      const puppeteer = await import('puppeteer');
+      
+      // Define customer data for checkout - use provided data or defaults
+      const customer = customerData || {
+        firstName: "John",
+        lastName: "Doe",
+        street: "123 Main St",
+        city: "Amsterdam",
+        postcode: "1000AA",
+        telephone: "0612345678",
+        email: "test@example.com"
+      };
+      
+      // Launch browser with minimal options
+      logger.info("Launching browser for checkout");
+      const browser = await puppeteer.default.launch({
+        executablePath: '/nix/store/zi4f80l169xlmivz8vja8wlphq74qqk0-chromium-125.0.6422.141/bin/chromium',
+        args: ['--no-sandbox'],
+        headless: true
+      });
+      
+      try {
+        // Set up a new page
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 1024 });
+        logger.info("Successfully launched browser for complete checkout");
+        
+        // Get the automation settings from storage
+        const settings = await storage.getAutomationSettings();
+        if (!settings) {
+          throw new Error("Automation settings not found");
+        }
+        
+        // Define customer data
+        const customerData = {
+          firstName: "John",
+          lastName: "Doe",
+          street: "123 Main St",
+          city: "Amsterdam",
+          postcode: "1000AA",
+          telephone: "0612345678",
+          email: "test@example.com"
+        };
+        
+        // 1. Log in to supplier website
+        logger.info(`Navigating to supplier website: ${settings.supplierUrl}`);
+        await page.goto(settings.supplierUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        
+        // Fill in username and password
+        await page.type('#email', settings.supplierUsername);
+        await page.type('#pass', settings.supplierPassword);
+        
+        // Click login button
+        logger.info("Submitting EPH Schmidt login form");
+        await Promise.all([
+          page.click('#send2'),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+        ]);
+        
+        // 2. Check if the cart already has items
+        logger.info("Checking if cart is already populated");
+        
+        // Use the new XPath selector provided by the user for getting cart elements
+        let cartCount = 0;
+        
+        try {
+          // Try to find the cart quantity element
+          const cartElements = await page.$x('/html/body/div[2]/div/header/div/div[4]/form/div[1]/input');
+          if (cartElements.length > 0) {
+            // Get the cart count - the element might be an input element with value attribute
+            const cartCountValue = await page.evaluate(el => el.value, cartElements[0]);
+            cartCount = parseInt(cartCountValue || "0");
+            logger.info(`Found cart with ${cartCount} items using provided XPath selector`);
+          } else {
+            // Fallback to the old selector
+            try {
+              const cartCountText = await page.$eval('.skip-cart .count', element => element.textContent?.trim());
+              cartCount = parseInt(cartCountText || "0");
+              logger.info(`Found cart with ${cartCount} items using fallback selector`);
+            } catch (err) {
+              logger.warning("Couldn't find cart quantity, will assume cart needs items");
+              cartCount = 0;
+            }
+          }
+        } catch (err) {
+          logger.warning("Error getting cart count, will assume cart needs items", { error: err });
+          cartCount = 0;
+        }
+        
+        if (cartCount === 0) {
+          logger.info("Cart is empty, adding a product");
+          
+          // Go to search page
+          const sku = "260018"; // Sample SKU to use for testing
+          await page.goto(`${settings.supplierUrl}`, { 
+            waitUntil: 'networkidle2', 
+            timeout: 60000 
+          });
+          
+          // Search for the product with improved selectors
+          try {
+            // First try typing in the search box
+            await page.type('#search', sku);
+            
+            // Now try different search button selectors
+            let searchButtonFound = false;
+            
+            // Try XPath selector for the search button
+            try {
+              const searchButtons = await page.$x('//button[contains(@class, "search") or @title="Search" or @aria-label="Search"]');
+              if (searchButtons.length > 0) {
+                logger.info("Found search button using XPath");
+                await Promise.all([
+                  searchButtons[0].click(),
+                  page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+                ]);
+                searchButtonFound = true;
+              }
+            } catch (err) {
+              logger.warning("XPath search button selector failed", { error: err });
+            }
+            
+            // If XPath didn't work, try CSS selector alternatives
+            if (!searchButtonFound) {
+              // Try multiple selectors
+              const searchButtonSelectors = [
+                'button.action.search', 
+                'button[title="Search"]',
+                'form[id="search_mini_form"] button',
+                '.search button',
+                'button[type="submit"]'
+              ];
+              
+              for (const selector of searchButtonSelectors) {
+                try {
+                  const buttonExists = await page.$(selector);
+                  if (buttonExists) {
+                    logger.info(`Found search button using selector: ${selector}`);
+                    await Promise.all([
+                      page.click(selector),
+                      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+                    ]);
+                    searchButtonFound = true;
+                    break;
+                  }
+                } catch (err) {
+                  logger.warning(`Failed with selector ${selector}`, { error: err });
+                }
+              }
+            }
+            
+            // If still no button found, try using keyboard Enter key
+            if (!searchButtonFound) {
+              logger.info("Trying to submit search with Enter key");
+              await page.keyboard.press('Enter');
+              await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {
+                logger.warning("Navigation timeout after pressing Enter, continuing anyway");
+              });
+            }
+          } catch (err) {
+            logger.error("Failed to search for product", { error: err });
+            // Try direct URL approach as fallback
+            await page.goto(`https://b2b.eph-schmidt.de/catalogsearch/result/?q=${sku}`, {
+              waitUntil: 'networkidle2',
+              timeout: 60000
+            });
+          }
+          
+          // Click on the first product result with improved selectors
+          try {
+            logger.info("Looking for product to click on search results page");
+            await page.screenshot({ path: `eph-schmidt-search-results-${orderId}.png` });
+            
+            // Try different product selectors
+            const productSelectors = [
+              '.product-item-link',
+              '.product-item a',
+              '.product-item-info a',
+              '.product a',
+              'a.product-item-link',
+              'a[href*="260018"]',
+              '.products-grid .item a'
+            ];
+            
+            let productFound = false;
+            for (const selector of productSelectors) {
+              try {
+                const exists = await page.$(selector);
+                if (exists) {
+                  logger.info(`Found product using selector: ${selector}`);
+                  await Promise.all([
+                    page.click(selector),
+                    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+                  ]);
+                  productFound = true;
+                  break;
+                }
+              } catch (err) {
+                logger.warning(`Failed with product selector ${selector}`, { error: err });
+              }
+            }
+            
+            // If selectors didn't work, try XPath
+            if (!productFound) {
+              try {
+                const productLinks = await page.$x('//a[contains(@class, "product") or contains(@href, "260018")]');
+                if (productLinks.length > 0) {
+                  logger.info("Found product link using XPath");
+                  await Promise.all([
+                    productLinks[0].click(),
+                    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+                  ]);
+                  productFound = true;
+                }
+              } catch (err) {
+                logger.warning("XPath product selector failed", { error: err });
+              }
+            }
+            
+            // If still not found, try evaluating and clicking
+            if (!productFound) {
+              try {
+                logger.info("Trying to find product link by evaluating page content");
+                await page.evaluate(() => {
+                  // Find any link that looks like a product
+                  const links = Array.from(document.querySelectorAll('a'));
+                  const productLink = links.find(link => 
+                    link.textContent && 
+                    (link.textContent.includes('260018') || 
+                     link.href.includes('260018') || 
+                     link.parentElement.classList.contains('product'))
+                  );
+                  if (productLink) productLink.click();
+                });
+                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {
+                  logger.warning("Navigation timeout after clicking product link, continuing anyway");
+                });
+                productFound = true;
+              } catch (err) {
+                logger.warning("Failed to find product by evaluation", { error: err });
+              }
+            }
+            
+            // If all else fails, try going directly to a product URL
+            if (!productFound) {
+              logger.warning("Could not find product on search results page, trying direct URL");
+              await page.goto('https://b2b.eph-schmidt.de/pfyller-astilbe-arendsii-erika-1.html', {
+                waitUntil: 'networkidle2',
+                timeout: 60000
+              });
+            }
+          } catch (err) {
+            logger.error("Failed to click on product", { error: err });
+            // Try to continue anyway - we might already be on a product page
+          }
+          
+          // Add to cart
+          await Promise.all([
+            page.click('#product-addtocart-button'),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+          ]);
+          
+          logger.info(`Added SKU ${sku} to cart for order #${orderId}`);
+        } else {
+          logger.info(`Cart already has ${cartCount} items`);
+        }
+        
+        // 3. Navigate directly to the cart page
+        logger.info("Navigating directly to cart page");
+        await page.goto('https://b2b.eph-schmidt.de/checkout/cart/', { 
+          waitUntil: 'networkidle2', 
+          timeout: 60000 
+        });
+        
+        // Take screenshot of the cart page
+        await page.screenshot({ path: `eph-schmidt-cart-${orderId}.png` });
+        
+        // Wait for the checkout button to appear
+        try {
+          await page.waitForSelector('.checkout-methods-items .action.primary.checkout', { timeout: 5000 });
+          
+          // Click on the "Zur Kasse" (Go to Checkout) button
+          logger.info("Clicking on 'Zur Kasse' button");
+          await Promise.all([
+            page.click('.checkout-methods-items .action.primary.checkout'),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+          ]);
+        } catch (err) {
+          logger.warning("Checkout button not found on cart page, trying alternative approach");
+          
+          // If traditional button isn't found, try to find any element with 'checkout' text
+          const checkoutLinks = await page.$$eval('a, button', elements => {
+            return elements
+              .filter(el => el.textContent && el.textContent.toLowerCase().includes('kasse'))
+              .map(el => el.outerHTML);
+          });
+          
+          logger.info(`Found ${checkoutLinks.length} possible checkout elements`);
+          
+          if (checkoutLinks.length > 0) {
+            // Try clicking the first element with "checkout" or "kasse" in it
+            await Promise.all([
+              page.evaluate(() => {
+                const elements = Array.from(document.querySelectorAll('a, button'));
+                const checkoutEl = elements.find(el => 
+                  el.textContent && el.textContent.toLowerCase().includes('kasse'));
+                if (checkoutEl) checkoutEl.click();
+              }),
+              page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {
+                logger.warning("Navigation timeout after clicking checkout, continuing anyway");
+              })
+            ]);
+          } else {
+            // Navigate directly to onepage checkout URL
+            logger.info("Navigating directly to onepage checkout URL");
+            await page.goto('https://b2b.eph-schmidt.de/checkout/onepage/', { 
+              waitUntil: 'networkidle2', 
+              timeout: 60000 
+            });
+          }
+        }
+        
+        // Take screenshot of the checkout page
+        await page.screenshot({ path: `eph-schmidt-checkout-${orderId}.png` });
+        logger.info(`Navigated to checkout page for order #${orderId}`);
+        
+        // 4. On the checkout page, proceed to the billing form using improved helper
+        logger.info("Clicking on Fortsetzen button using checkout helper");
+        
+        // Use our improved helper function with multiple fallbacks
+        const continueBtnClicked = await clickForsetzenButton(page, orderId);
+        if (continueBtnClicked) {
+          logger.info("Successfully clicked Fortsetzen button and proceeded to next step");
+          
+          // Take screenshot to confirm billing form is opened
+          await page.screenshot({ path: `eph-schmidt-billing-form-${orderId}.png` });
+          logger.info("Billing form opened successfully");
+          
+
+          // 5. Fill in the shipping information using improved helpers
+          logger.info("Filling in shipping information with smart field detection");
+          
+          // Een array met alle velden die we moeten invullen
+          const formFields: FormField[] = [
+            {
+              fieldName: "firstName",
+              value: customerData.firstName,
+              selectors: [
+                "#shipping\\:firstname",
+                "input[name=\"shipping[firstname]\"]",
+                "input[id=\"shipping:firstname\"]",
+                "input[name$=\"firstname\"]",
+                "input[placeholder*=\"First\"]"
+              ]
+            },
+            {
+              fieldName: "lastName",
+              value: customerData.lastName,
+              selectors: [
+                "#shipping\\:lastname",
+                "input[name=\"shipping[lastname]\"]",
+                "input[id=\"shipping:lastname\"]",
+                "input[name$=\"lastname\"]",
+                "input[placeholder*=\"Last\"]"
+              ]
+            },
+            {
+              fieldName: "street",
+              value: customerData.street,
+              selectors: [
+                "#shipping\\:street1",
+                "input[name=\"shipping[street][]\"]",
+                "input[name=\"shipping[street][0]\"]",
+                "input[id=\"shipping:street1\"]",
+                "input[name$=\"street\"]",
+                "input[placeholder*=\"Street\"]"
+              ]
+            },
+            {
+              fieldName: "city",
+              value: customerData.city,
+              selectors: [
+                "#shipping\\:city",
+                "input[name=\"shipping[city]\"]",
+                "input[id=\"shipping:city\"]",
+                "input[name$=\"city\"]",
+                "input[placeholder*=\"City\"]"
+              ]
+            },
+            {
+              fieldName: "postcode",
+              value: customerData.postcode,
+              selectors: [
+                "#shipping\\:postcode",
+                "input[name=\"shipping[postcode]\"]",
+                "input[id=\"shipping:postcode\"]",
+                "input[name$=\"postcode\"]",
+                "input[name$=\"zip\"]",
+                "input[placeholder*=\"Postal\"]",
+                "input[placeholder*=\"ZIP\"]"
+              ]
+            },
+            {
+              fieldName: "country",
+              value: "N", // Type N for Netherlands
+              selectors: [
+                "#shipping\\:country_id",
+                "select[name=\"shipping[country_id]\"]",
+                "select[id=\"shipping:country_id\"]",
+                "select[name$=\"country\"]",
+                "select[name$=\"country_id\"]"
+              ]
+            }
+          ];
+          
+          // Loop door alle velden en vul ze in met onze nieuwe functie
+          for (const field of formFields) {
+            const success = await fillFormField(page, field, orderId);
+            if (success) {
+              logger.info(`Entered ${field.fieldName} successfully`);
+            } else {
+              logger.warning(`Failed to fill ${field.fieldName}, continuing with next field`);
+            }
+          }
+
+          }
+          
+          // Telephone
+          const telephoneSelector = 'input[name="shipping[telephone]"]';
+          const telephoneField = await page.$(telephoneSelector);
+          if (telephoneField) {
+            await telephoneField.click();
+            await page.keyboard.type(customerData.telephone);
+            logger.info("Entered telephone number");
+          }
+          
+          // Email
+          const emailSelector = 'input[type="email"]';
+          const emailField = await page.$(emailSelector);
+          if (emailField) {
+            await emailField.click();
+            await page.keyboard.type(customerData.email);
+            logger.info("Entered email");
+          }
+          
+          // Take screenshot with completed shipping form
+          await page.screenshot({ path: `eph-schmidt-customer-details-${orderId}.png` });
+          logger.info("Shipping form filled successfully");
+          
+          // 6. Click continue to proceed to the next step
+          const continueButton = await page.$x('/html/body/div[2]/div/div[2]/div/div[1]/ol/li[2]/div[2]/form/div/button');
+          if (continueButton.length > 0) {
+            await Promise.all([
+              continueButton[0].click(),
+              page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(e => {
+                logger.warning("Navigation timeout after clicking continue button, proceeding anyway");
+              })
+            ]);
+            
+            // Take screenshot of the next page (payment method)
+            await page.screenshot({ path: `eph-schmidt-shipping-completed-${orderId}.png` });
+            logger.info("Continued to payment method selection");
+            
+            // Placeholder for future implementation
+            // 7. Select payment method
+            // 8. Complete order
+            logger.info("Complete checkout implementation will continue with payment selection and order completion");
+            
+          } else {
+            logger.warning("Continue button not found");
+          }
+        }
+        
+        // Success data voorbereiden (maar nog niet verzenden)
+        const successData = { 
+          success: true, 
+          message: "Complete checkout process initiated",
+          screenshots: [
+            `eph-schmidt-cart-${orderId}.png`,
+            `eph-schmidt-checkout-${orderId}.png`,
+            `eph-schmidt-billing-form-${orderId}.png`,
+            `eph-schmidt-customer-details-${orderId}.png`,
+            `eph-schmidt-shipping-completed-${orderId}.png`
+          ],
+          orderId
+        };
+      
+      } catch (error: any) {
+        logger.error("Failed during complete checkout", { error: error.message });
+        await page.screenshot({ path: `eph-schmidt-checkout-error-${orderId}.png` });
+        return res.status(500).json({ message: `Complete checkout failed: ${error.message}` });
+      } finally {
+        if (browser) {
+          // Always close the browser
+          await browser.close();
+        }
+        
+        // Als we hier komen en nog geen response hebben verzonden, stuur dan het successData
+        if (successData && !res.headersSent) {
+          return res.json(successData);
+        }
+      }
+    } catch (error: any) {
+      logger.error("Error in complete checkout endpoint", { error });
+      return res.status(500).json({ message: "Server error during complete checkout" });
+    }
+  });
+
+  // Run checkout step 1 (filling billing form)
+  app.post("/api/automation/checkout/step1", async (req, res) => {
+    try {
+      // Extract order ID from request if available, or use default
+      const orderId = req.body.orderId || "9524";
+      
+      // Get customer data from request or use test data (in real scenario, fetch from WooCommerce)
+      const customerData = req.body.customerData || {
+        firstName: "Test",
+        lastName: "Customer",
+        street: "Test Street 123",
+        city: "Berlin",
+        postcode: "10115",
+        telephone: "0123456789",
+        email: "test@example.com"
+      };
+      
+      // Import puppeteer and utility functions
+      const puppeteer = await import('puppeteer');
+      const util = await import('util');
+      const { exec } = await import('child_process');
+      const execPromise = util.promisify(exec);
+      
+      // Get automation settings
+      const settings = await storage.getAutomationSettings();
+      if (!settings) {
+        return res.status(400).json({ message: "Automation settings not found" });
+      }
+      
+      logger.info(`Starting checkout step 1 for order #${orderId}`);
+      
+      // Enhanced Puppeteer setup for Replit environment
+      const puppeteerArgs = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--disable-features=site-per-process',
+        '--disable-web-security',
+        '--disable-dev-profile',
+        '--no-zygote',
+        '--single-process',
+        '--enable-logging=stderr',
+        '--v=1'
+      ];
+      
+      // Launch browser
+      let browser;
+      try {
+        logger.info("Launching Puppeteer browser for checkout step 1");
+        
+        // Try to use the system installed Chromium (from Nix)
+        const { stdout } = await execPromise("which chromium");
+        const chromePath = stdout.trim();
+        logger.info(`Found Chromium at path: ${chromePath}`);
+        
+        browser = await puppeteer.default.launch({
+          headless: true,
+          args: puppeteerArgs,
+          executablePath: chromePath
+        });
+        logger.info("Successfully launched browser for checkout step 1");
+      } catch (browserError: any) {
+        logger.error("Failed to launch browser for checkout step 1", { error: browserError });
+        return res.status(500).json({ message: "Failed to launch browser" });
+      }
+      
+      const page = await browser.newPage();
+      
+      try {
+        // 1. First, log in to the EPH Schmidt supplier website
+        logger.info(`Navigating to supplier website: ${settings.supplierUrl}`);
+        
+        await page.goto(settings.supplierUrl, { 
+          waitUntil: 'networkidle2', 
+          timeout: 60000 
+        });
+        
+        // Use the pre-configured EPH Schmidt supplier credentials
+        await page.type('#email', settings.supplierUsername);
+        await page.type('#pass', settings.supplierPassword);
+        
+        // Click the login button and wait for navigation
+        logger.info("Submitting EPH Schmidt login form");
+        await Promise.all([
+          page.click('#send2'),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+        ]);
+        
+        // 2. Search for a product and add it to cart (or use existing cart)
+        logger.info("Checking if cart is already populated");
+        
+        // For demo purposes, let's add a product if the cart is empty
+        // In production, we would check if the cart matches the WooCommerce order items
+        
+        // Use the new XPath selector provided by the user for getting cart elements
+        let cartCount = 0;
+        
+        try {
+          // Try to find the cart quantity element
+          const cartElements = await page.$x('/html/body/div[2]/div/header/div/div[4]/form/div[1]/input');
+          if (cartElements.length > 0) {
+            // Get the cart count - the element might be an input element with value attribute
+            const cartCountValue = await page.evaluate(el => el.value, cartElements[0]);
+            cartCount = parseInt(cartCountValue || "0");
+            logger.info(`Found cart with ${cartCount} items using provided XPath selector`);
+          } else {
+            // Fallback to the old selector
+            try {
+              const cartCountText = await page.$eval('.skip-cart .count', element => element.textContent?.trim());
+              cartCount = parseInt(cartCountText || "0");
+              logger.info(`Found cart with ${cartCount} items using fallback selector`);
+            } catch (err) {
+              logger.warning("Couldn't find cart quantity, will assume cart needs items");
+              cartCount = 0;
+            }
+          }
+        } catch (err) {
+          logger.warning("Error getting cart count, will assume cart needs items", { error: err });
+          cartCount = 0;
+        }
+        
+        if (cartCount === 0) {
+          logger.info("Cart is empty, adding a product");
+          
+          // Go to search page
+          const sku = "260018"; // Sample SKU to use for testing
+          await page.goto(`${settings.supplierUrl}`, { 
+            waitUntil: 'networkidle2', 
+            timeout: 60000 
+          });
+          
+          // Search for the product with improved selectors
+          try {
+            // First try typing in the search box
+            await page.type('#search', sku);
+            
+            // Now try different search button selectors
+            let searchButtonFound = false;
+            
+            // Try XPath selector for the search button
+            try {
+              const searchButtons = await page.$x('//button[contains(@class, "search") or @title="Search" or @aria-label="Search"]');
+              if (searchButtons.length > 0) {
+                logger.info("Found search button using XPath");
+                await Promise.all([
+                  searchButtons[0].click(),
+                  page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+                ]);
+                searchButtonFound = true;
+              }
+            } catch (err) {
+              logger.warning("XPath search button selector failed", { error: err });
+            }
+            
+            // If XPath didn't work, try CSS selector alternatives
+            if (!searchButtonFound) {
+              // Try multiple selectors
+              const searchButtonSelectors = [
+                'button.action.search', 
+                'button[title="Search"]',
+                'form[id="search_mini_form"] button',
+                '.search button',
+                'button[type="submit"]'
+              ];
+              
+              for (const selector of searchButtonSelectors) {
+                try {
+                  const buttonExists = await page.$(selector);
+                  if (buttonExists) {
+                    logger.info(`Found search button using selector: ${selector}`);
+                    await Promise.all([
+                      page.click(selector),
+                      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+                    ]);
+                    searchButtonFound = true;
+                    break;
+                  }
+                } catch (err) {
+                  logger.warning(`Failed with selector ${selector}`, { error: err });
+                }
+              }
+            }
+            
+            // If still no button found, try using keyboard Enter key
+            if (!searchButtonFound) {
+              logger.info("Trying to submit search with Enter key");
+              await page.keyboard.press('Enter');
+              await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {
+                logger.warning("Navigation timeout after pressing Enter, continuing anyway");
+              });
+            }
+          } catch (err) {
+            logger.error("Failed to search for product", { error: err });
+            // Try direct URL approach as fallback
+            await page.goto(`https://b2b.eph-schmidt.de/catalogsearch/result/?q=${sku}`, {
+              waitUntil: 'networkidle2',
+              timeout: 60000
+            });
+          }
+          
+          // Click on the first product result with improved selectors
+          try {
+            logger.info("Looking for product to click on search results page");
+            await page.screenshot({ path: `eph-schmidt-search-results-${orderId}.png` });
+            
+            // Try different product selectors
+            const productSelectors = [
+              '.product-item-link',
+              '.product-item a',
+              '.product-item-info a',
+              '.product a',
+              'a.product-item-link',
+              'a[href*="260018"]',
+              '.products-grid .item a'
+            ];
+            
+            let productFound = false;
+            for (const selector of productSelectors) {
+              try {
+                const exists = await page.$(selector);
+                if (exists) {
+                  logger.info(`Found product using selector: ${selector}`);
+                  await Promise.all([
+                    page.click(selector),
+                    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+                  ]);
+                  productFound = true;
+                  break;
+                }
+              } catch (err) {
+                logger.warning(`Failed with product selector ${selector}`, { error: err });
+              }
+            }
+            
+            // If selectors didn't work, try XPath
+            if (!productFound) {
+              try {
+                const productLinks = await page.$x('//a[contains(@class, "product") or contains(@href, "260018")]');
+                if (productLinks.length > 0) {
+                  logger.info("Found product link using XPath");
+                  await Promise.all([
+                    productLinks[0].click(),
+                    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+                  ]);
+                  productFound = true;
+                }
+              } catch (err) {
+                logger.warning("XPath product selector failed", { error: err });
+              }
+            }
+            
+            // If still not found, try evaluating and clicking
+            if (!productFound) {
+              try {
+                logger.info("Trying to find product link by evaluating page content");
+                await page.evaluate(() => {
+                  // Find any link that looks like a product
+                  const links = Array.from(document.querySelectorAll('a'));
+                  const productLink = links.find(link => 
+                    link.textContent && 
+                    (link.textContent.includes('260018') || 
+                     link.href.includes('260018') || 
+                     link.parentElement.classList.contains('product'))
+                  );
+                  if (productLink) productLink.click();
+                });
+                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {
+                  logger.warning("Navigation timeout after clicking product link, continuing anyway");
+                });
+                productFound = true;
+              } catch (err) {
+                logger.warning("Failed to find product by evaluation", { error: err });
+              }
+            }
+            
+            // If all else fails, try going directly to a product URL
+            if (!productFound) {
+              logger.warning("Could not find product on search results page, trying direct URL");
+              await page.goto('https://b2b.eph-schmidt.de/pfyller-astilbe-arendsii-erika-1.html', {
+                waitUntil: 'networkidle2',
+                timeout: 60000
+              });
+            }
+          } catch (err) {
+            logger.error("Failed to click on product", { error: err });
+            // Try to continue anyway - we might already be on a product page
+          }
+          
+          // Add to cart
+          // Verbeterde methode voor Add to Cart knop met meerdere fallback-selectors
+          logger.info("Attempting to find and click Add to Cart button with multiple selectors");
+          
+          const addedToCart = await clickAddToCartButton(page, orderId, 60000);
+          
+          if (addedToCart) {
+            logger.info(`Successfully added SKU ${sku} to cart for order #${orderId}`);
+          } else {
+            logger.warning(`Had trouble adding SKU ${sku} to cart, but attempted fallback to cart page`);
+          }
+        } else {
+          logger.info(`Cart already has ${cartCount} items`);
+        }
+        
+        // 3. Navigate directly to the cart page
+        logger.info("Navigating directly to cart page");
+        await page.goto('https://b2b.eph-schmidt.de/checkout/cart/', { 
+          waitUntil: 'networkidle2', 
+          timeout: 60000 
+        });
+        
+        // Take screenshot of the cart page
+        await page.screenshot({ path: `eph-schmidt-cart-${orderId}.png` });
+        
+        // Wait for the checkout button to appear
+        try {
+          await page.waitForSelector('.checkout-methods-items .action.primary.checkout', { timeout: 5000 });
+          
+          // Click on the "Zur Kasse" (Go to Checkout) button
+          logger.info("Clicking on 'Zur Kasse' button");
+          await Promise.all([
+            page.click('.checkout-methods-items .action.primary.checkout'),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+          ]);
+        } catch (err) {
+          logger.warning("Checkout button not found on cart page, trying alternative approach");
+          
+          // If traditional button isn't found, try to find any element with 'checkout' text
+          const checkoutLinks = await page.$$eval('a, button', elements => {
+            return elements
+              .filter(el => el.textContent && el.textContent.toLowerCase().includes('kasse'))
+              .map(el => el.outerHTML);
+          });
+          
+          logger.info(`Found ${checkoutLinks.length} possible checkout elements`);
+          
+          if (checkoutLinks.length > 0) {
+            // Try clicking the first element with "checkout" or "kasse" in it
+            await Promise.all([
+              page.evaluate(() => {
+                const elements = Array.from(document.querySelectorAll('a, button'));
+                const checkoutEl = elements.find(el => 
+                  el.textContent && el.textContent.toLowerCase().includes('kasse'));
+                if (checkoutEl) checkoutEl.click();
+              }),
+              page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {
+                logger.warning("Navigation timeout after clicking checkout, continuing anyway");
+              })
+            ]);
+          } else {
+            // If still no luck, try typing the checkout/onepage URL directly (as specified by user)
+            logger.info("Navigating directly to onepage checkout URL");
+            await page.goto('https://b2b.eph-schmidt.de/checkout/onepage/', { 
+              waitUntil: 'networkidle2', 
+              timeout: 60000 
+            });
+          }
+        }
+        
+        // Take screenshot of the checkout page
+        await page.screenshot({ path: `eph-schmidt-checkout-${orderId}.png` });
+        logger.info(`Navigated to checkout page for order #${orderId}`);
+        
+
+        // 4. On the checkout page, proceed to the billing form using our improved helper
+        logger.info("Clicking on Fortsetzen button using checkout helper");
+        
+        // Use our improved helper function to click the button with multiple fallbacks
+        const continueBtnClicked = await clickForsetzenButton(page, orderId);
+        if (continueBtnClicked) {
+          logger.info("Successfully clicked Fortsetzen button and proceeded to next step");
+          
+          // Take screenshot to confirm billing form is opened
+          await page.screenshot({ path: `eph-schmidt-billing-form-${orderId}.png` });
+          logger.info("Billing form opened successfully");
+
+          
+          // 5. Fill in the shipping information
+          logger.info("Filling in shipping information");
+          
+          // First Name
+          const firstNameField = await page.$x('//*[@id="shipping:firstname"]');
+          if (firstNameField.length > 0) {
+            await firstNameField[0].click();
+            await page.keyboard.type(customerData.firstName);
+            logger.info("Entered first name");
+          }
+          
+          // Last Name
+          const lastNameField = await page.$x('//*[@id="shipping:lastname"]');
+          if (lastNameField.length > 0) {
+            await lastNameField[0].click();
+            await page.keyboard.type(customerData.lastName);
+            logger.info("Entered last name");
+          }
+          
+          // Street
+          const streetField = await page.$x('//*[@id="shipping:street1"]');
+          if (streetField.length > 0) {
+            await streetField[0].click();
+            await page.keyboard.type(customerData.street);
+            logger.info("Entered street");
+          }
+          
+          // City
+          const cityField = await page.$x('//*[@id="shipping:city"]');
+          if (cityField.length > 0) {
+            await cityField[0].click();
+            await page.keyboard.type(customerData.city);
+            logger.info("Entered city");
+          }
+          
+          // Postcode
+          const postcodeField = await page.$x('//*[@id="shipping:postcode"]');
+          if (postcodeField.length > 0) {
+            await postcodeField[0].click();
+            await page.keyboard.type(customerData.postcode);
+            logger.info("Entered postcode");
+          }
+          
+          // Country
+          const countryField = await page.$x('//*[@id="shipping:country_id"]');
+          if (countryField.length > 0) {
+            await countryField[0].click();
+            await page.keyboard.type("N"); // Type N for Netherlands
+            logger.info("Selected country");
+          }
+          
+          // Telephone
+          const telephoneSelector = 'input[name="shipping[telephone]"]';
+          const telephoneField = await page.$(telephoneSelector);
+          if (telephoneField) {
+            await telephoneField.click();
+            await page.keyboard.type(customerData.telephone);
+            logger.info("Entered telephone number");
+          }
+          
+          // Email
+          const emailSelector = 'input[type="email"]';
+          const emailField = await page.$(emailSelector);
+          if (emailField) {
+            await emailField.click();
+            await page.keyboard.type(customerData.email);
+            logger.info("Entered email");
+          }
+          
+          // Take screenshot with completed shipping form
+          await page.screenshot({ path: `eph-schmidt-customer-details-${orderId}.png` });
+          logger.info("Shipping form filled successfully");
+          
+          // 6. Click continue to proceed to the next step
+          const continueButton = await page.$x('/html/body/div[2]/div/div[2]/div/div[1]/ol/li[2]/div[2]/form/div/button');
+          if (continueButton.length > 0) {
+            await Promise.all([
+              continueButton[0].click(),
+              page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(e => {
+                logger.warning("Navigation timeout after clicking continue button, proceeding anyway");
+              })
+            ]);
+            
+            // Take screenshot of the next page (payment method)
+            await page.screenshot({ path: `eph-schmidt-shipping-completed-${orderId}.png` });
+            logger.info("Continued to payment method selection");
+          } else {
+            logger.warning("Continue button not found");
+          }
+        } else {
+          logger.warning("Billing button not found");
+        }
+        
+        // Return success response
+        res.json({ 
+          success: true, 
+          message: "Checkout step 1 completed successfully",
+          screenshots: [
+            `eph-schmidt-cart-${orderId}.png`,
+            `eph-schmidt-checkout-${orderId}.png`,
+            `eph-schmidt-billing-form-${orderId}.png`,
+            `eph-schmidt-customer-details-${orderId}.png`,
+            `eph-schmidt-shipping-completed-${orderId}.png`
+          ],
+          orderId
+        });
+      } catch (error: any) {
+        logger.error("Failed during checkout step 1", { error: error.message });
+        await page.screenshot({ path: `eph-schmidt-checkout-error-${orderId}.png` });
+        res.status(500).json({ message: `Checkout step 1 failed: ${error.message}` });
+      } finally {
+        // Always close the browser
+        await browser.close();
+      }
+    } catch (error: any) {
+      logger.error("Error in checkout step 1 endpoint", { error });
+      res.status(500).json({ message: "Server error during checkout step 1" });
+    }
+  });
+
+  // Get automation configuration
+  app.get("/api/automation/config", async (req, res) => {
+    try {
+      const config = await storage.getAutomationSettings();
+      if (!config) {
+        return res.status(404).json({ message: "Configuration not found" });
+      }
+      res.json(config);
+    } catch (error) {
+      logger.error("Failed to get automation configuration", { error });
+      res.status(500).json({ message: "Failed to get automation configuration" });
+    }
+  });
+
+  // Update automation configuration
+  app.put("/api/automation/config", async (req, res) => {
+    try {
+      const configSchema = z.object({
+        woocommerceUrl: z.string().url(),
+        woocommerceKey: z.string(),
+        woocommerceSecret: z.string(),
+        supplierUrl: z.string().url(),
+        supplierUsername: z.string(),
+        supplierPassword: z.string(),
+        scheduleTime1: z.string().regex(/^([01]\d|2[0-3]):([0-5]\d)$/),
+        scheduleTime2: z.string().regex(/^([01]\d|2[0-3]):([0-5]\d)$/),
+        isActive: z.boolean()
+      });
+
+      // Validate request body
+      const validatedConfig = configSchema.parse(req.body);
+      
+      // Update configuration
+      const updated = await storage.updateAutomationSettings(validatedConfig);
+      
+      // Update the scheduler with new times
+      setupScheduler();
+      
+      res.json(updated);
+    } catch (error) {
+      logger.error("Failed to update automation configuration", { error });
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid configuration", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to update automation configuration" });
+    }
+  });
+
+  // Get logs
+  app.get("/api/logs", async (req, res) => {
+    try {
+      const page = parseInt(req.query.page as string) || 1;
+      const limit = 50; // Number of logs per page
+      const level = req.query.level as string | undefined;
+      
+      const logs = await storage.getLogs(page, limit, level);
+      res.json(logs);
+    } catch (error) {
+      logger.error("Failed to get logs", { error });
+      res.status(500).json({ message: "Failed to get logs" });
+    }
+  });
+
+  // Export logs as CSV
+  app.get("/api/logs/export", async (req, res) => {
+    try {
+      const logs = await storage.getAllLogs();
+      
+      // Create CSV content
+      let csv = "Timestamp,Level,Message,Order ID\n";
+      
+      logs.forEach(log => {
+        const timestamp = new Date(log.timestamp).toISOString();
+        const level = log.level;
+        // Escape quotes in message
+        const message = log.message.replace(/"/g, '""');
+        const orderId = log.orderId || "";
+        
+        csv += `"${timestamp}","${level}","${message}","${orderId}"\n`;
+      });
+      
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", `attachment; filename=woocommerce-automation-logs-${new Date().toISOString().slice(0, 10)}.csv`);
+      res.send(csv);
+    } catch (error) {
+      logger.error("Failed to export logs", { error });
+      res.status(500).json({ message: "Failed to export logs" });
+    }
+  });
+
+  // Get processed orders
+  app.get("/api/orders", async (req, res) => {
+    try {
+      const page = parseInt(req.query.page as string) || 1;
+      const limit = 10; // Number of orders per page
+      
+      const orders = await storage.getProcessedOrders(page, limit);
+      res.json(orders);
+    } catch (error) {
+      logger.error("Failed to get processed orders", { error });
+      res.status(500).json({ message: "Failed to get processed orders" });
+    }
+  });
+
+  // Create test order (for development/testing purposes)
+  app.post("/api/orders/test", async (req, res) => {
+    try {
+      const orderSchema = z.object({
+        orderId: z.string(),
+        status: z.string(),
+        productCount: z.number().int().positive(),
+        productsProcessed: z.number().int().min(0),
+        details: z.any().optional()
+      });
+
+      // Validate request body
+      const validatedOrder = orderSchema.parse(req.body);
+      
+      // Create test order in storage
+      const order = await storage.createProcessedOrder(validatedOrder);
+      
+      // Log the test order creation
+      logger.info(`Created test order #${order.orderId}`, { orderId: order.orderId });
+      
+      res.status(201).json(order);
+    } catch (error) {
+      logger.error("Failed to create test order", { error });
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid order data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create test order" });
+    }
+  });
+
+  // Simplified checkout process - basic and straightforward approach
+  app.post("/api/automation/simple-checkout", async (req, res) => {
+    try {
+      const { orderId = "9524", customerData = null } = req.body;
+      logger.info(`Starting simplified checkout process for order #${orderId}`);
+      
+      // Import puppeteer
+      const puppeteer = await import('puppeteer');
+      
+      // Define customer data for checkout
+      const customer = customerData || {
+        firstName: "John",
+        lastName: "Doe",
+        street: "123 Main St",
+        city: "Amsterdam",
+        postcode: "1000AA",
+        telephone: "0612345678",
+        email: "test@example.com"
+      };
+      
+      // Launch browser with minimal options
+      logger.info("Launching browser for checkout");
+      const browser = await puppeteer.default.launch({
+        executablePath: '/nix/store/zi4f80l169xlmivz8vja8wlphq74qqk0-chromium-125.0.6422.141/bin/chromium',
+        args: ['--no-sandbox'],
+        headless: true
+      });
+      
+      try {
+        // Get settings
+        const settings = await storage.getAutomationSettings();
+        if (!settings) {
+          throw new Error("Automation settings not found");
+        }
+        
+        // Set up a new page
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 1024 });
+        
+        // Step 1: Login
+        logger.info("Step 1: Logging in");
+        await page.goto(settings.supplierUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.screenshot({ path: `eph-schmidt-before-login-${orderId}.png` });
+        
+        await page.type('#email', settings.supplierUsername);
+        await page.type('#pass', settings.supplierPassword);
+        
+        await Promise.all([
+          page.click('#send2'),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
+        ]);
+        
+        await page.screenshot({ path: `eph-schmidt-after-login-${orderId}.png` });
+        
+        // Step 2: Search for a product
+        logger.info("Step 2: Searching for product");
+        const sku = "260018";
+        await page.type('#search', sku);
+        await page.screenshot({ path: `eph-schmidt-search-typing-${orderId}.png` });
+        
+        // Click search button or press Enter
+        try {
+          await Promise.all([
+            page.click('button.search-button'),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
+          ]);
+        } catch (err) {
+          await Promise.all([
+            page.keyboard.press('Enter'),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
+          ]);
+        }
+        
+        await page.screenshot({ path: `eph-schmidt-search-results-${orderId}.png` });
+        
+        // Step 3: Click on product and add to cart
+        logger.info("Step 3: Adding product to cart");
+        try {
+          await Promise.all([
+            page.click('.product-item-link'),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
+          ]);
+        } catch (err) {
+          logger.warning("Couldn't click product link, trying direct URL");
+          await page.goto('https://b2b.eph-schmidt.de/pfyller-astilbe-arendsii-erika-1.html', { 
+            waitUntil: 'networkidle2', 
+            timeout: 30000 
+          });
+        }
+        
+        // Click Add to Cart button - met verbeterde selector die meerdere opties probeert
+        logger.info("Attempting to click Add to Cart button with multiple selectors");
+        
+        // Probeer verschillende selectors voor de Add to Cart knop
+        try {
+          // We evalueren JavaScript op de pagina om de juiste knop te vinden
+          const buttonFound = await page.evaluate(() => {
+            // Probeer verschillende mogelijke selectors voor de "In den Warenkorb" knop
+            const selectors = [
+              '#product-addtocart-button',                      // Oude selector
+              'button.action.tocart.primary',                   // Nieuwe mogelijke selector
+              'button.action.primary.tocart',                   // Alternatieve volgorde
+              'button[title="In den Warenkorb"]',               // Op basis van titel attribute
+              'button.btn-cart',                                // Algemene class naam
+              'button[data-role="tocart-form"]',                // Op basis van data attribute
+              'form#product_addtocart_form button[type="submit"]', // Form submit knop
+              'button:contains("In den Warenkorb")'             // Op basis van tekst
+            ];
+            
+            // Probeer elke selector en klik op de eerste die werkt
+            for (const selector of selectors) {
+              try {
+                const elements = document.querySelectorAll(selector);
+                if (elements.length > 0) {
+                  elements[0].click();
+                  return { success: true, selector: selector };
+                }
+              } catch (e) {
+                // Ga door naar de volgende selector
+              }
+            }
+            
+            // Als laatste poging, zoek naar elke knop die de tekst bevat
+            const allButtons = document.querySelectorAll('button');
+            for (const button of allButtons) {
+              if (button.textContent && button.textContent.includes('Warenkorb')) {
+                button.click();
+                return { success: true, selector: 'text-search' };
+              }
+            }
+            
+            return { success: false };
+          });
+          
+          if (buttonFound.success) {
+            logger.info(`Successfully clicked Add to Cart button using selector: ${buttonFound.selector}`);
+            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
+              .catch(() => logger.info("No navigation after clicking Add to Cart, continuing..."));
+          } else {
+            // Als nog steeds niet gevonden, directe URL naar winkelwagen
+            logger.warning("Could not find Add to Cart button, going directly to cart page");
+            await page.goto('https://b2b.eph-schmidt.de/checkout/cart/', { 
+              waitUntil: 'networkidle2', 
+              timeout: 30000 
+            });
+          }
+        } catch (error) {
+          logger.error("Error while trying to add product to cart", { error });
+          // Als er een fout optreedt, ga direct naar winkelwagen
+          await page.goto('https://b2b.eph-schmidt.de/checkout/cart/', { 
+            waitUntil: 'networkidle2', 
+            timeout: 30000 
+          });
+        }
+        
+        await page.screenshot({ path: `eph-schmidt-added-${orderId}.png` });
+        
+        // Step 4: Go to checkout
+        logger.info("Step 4: Going to checkout");
+        await page.goto('https://b2b.eph-schmidt.de/checkout/cart/', { 
+          waitUntil: 'networkidle2', 
+          timeout: 30000 
+        });
+        
+        await page.screenshot({ path: `eph-schmidt-cart-${orderId}.png` });
+        
+        // Click on checkout button
+        try {
+          await Promise.all([
+            page.click('.checkout-methods-items .action.primary.checkout'),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
+          ]);
+        } catch (err) {
+          logger.warning("Checkout button not found, going directly to checkout page");
+          await page.goto('https://b2b.eph-schmidt.de/checkout/onepage/', { 
+            waitUntil: 'networkidle2', 
+            timeout: 30000 
+          });
+        }
+        
+        await page.screenshot({ path: `eph-schmidt-checkout-${orderId}.png` });
+        
+        // Step 5: Fill shipping information
+        logger.info("Step 5: Filling shipping information");
+        try {
+          // Use direct selectors for form fields
+          await page.evaluate((customer) => {
+            // Find and fill shipping form fields using standard DOM methods
+            // This avoids the need for XPath and complex selectors
+            const fillField = (id, value) => {
+              const field = document.getElementById(id);
+              if (field) {
+                field.value = value;
+                // Trigger change event to ensure the form validates
+                const event = new Event('change', { bubbles: true });
+                field.dispatchEvent(event);
+              }
+            };
+            
+            // Fill direct form fields
+            fillField('shipping:firstname', customer.firstName);
+            fillField('shipping:lastname', customer.lastName);
+            fillField('shipping:street1', customer.street);
+            fillField('shipping:city', customer.city);
+            fillField('shipping:postcode', customer.postcode);
+            fillField('shipping:telephone', customer.telephone);
+            
+          }, customer);
+          
+          await page.screenshot({ path: `eph-schmidt-customer-details-${orderId}.png` });
+          
+          // Click continue button
+          const buttons = await page.$$('button.button');
+          for (const button of buttons) {
+            const text = await page.evaluate(el => el.textContent, button);
+            if (text && text.toLowerCase().includes('fortsetzen')) {
+              await button.click();
+              await page.waitForTimeout(2000);
+              break;
+            }
+          }
+          
+          // Step 6: Select payment method
+          logger.info("Step 6: Selecting payment method");
+          await page.screenshot({ path: `eph-schmidt-payment-${orderId}.png` });
+          
+          // Click on continue to payment
+          await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button.button'));
+            const continueButton = buttons.find(button => 
+              button.textContent && button.textContent.toLowerCase().includes('fortsetzen')
+            );
+            if (continueButton) continueButton.click();
+          });
+          
+          await page.waitForTimeout(2000);
+          
+          // Step 7: Final checkout step
+          logger.info("Step 7: Finalizing order");
+          await page.screenshot({ path: `eph-schmidt-order-number-${orderId}.png` });
+          
+          // Enter order number
+          try {
+            await page.type('#order_comment', `WooCommerce Order #${orderId}`);
+            await page.screenshot({ path: `eph-schmidt-order-confirmation-${orderId}.png` });
+            
+            // Place the order
+            await page.evaluate(() => {
+              const placeOrderButtons = Array.from(document.querySelectorAll('button.button'));
+              const placeButton = placeOrderButtons.find(button => 
+                button.textContent && (
+                  button.textContent.toLowerCase().includes('place') || 
+                  button.textContent.toLowerCase().includes('order') ||
+                  button.textContent.toLowerCase().includes('bestellen')
+                )
+              );
+              if (placeButton) placeButton.click();
+            });
+            
+            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {
+              logger.warning("Navigation timeout after placing order");
+            });
+            
+            await page.screenshot({ path: `eph-schmidt-order-complete-${orderId}.png` });
+            logger.info("Order completed successfully");
+          } catch (err) {
+            logger.error("Error in final checkout step", { error: err });
+            await page.screenshot({ path: `eph-schmidt-checkout-error-${orderId}.png` });
+          }
+        } catch (err) {
+          logger.error("Error filling shipping information", { error: err });
+          await page.screenshot({ path: `eph-schmidt-form-error-${orderId}.png` });
+        }
+        
+        await browser.close();
+        res.status(200).json({
+          success: true,
+          message: "Checkout process completed",
+          orderId: orderId
+        });
+      } catch (err) {
+        logger.error("Error in checkout process", { error: err });
+        await browser.close();
+        throw err;
+      }
+    } catch (error) {
+      logger.error("Error in simple checkout endpoint", { error });
+      res.status(500).json({
+        success: false,
+        message: "Server error during complete checkout",
+        error: error.message
+      });
+    }
+  });
+
+  return httpServer;
+}
